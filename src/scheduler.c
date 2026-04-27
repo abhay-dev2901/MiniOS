@@ -143,3 +143,23 @@ void scheduler_dump_ps(void) {
         print("\n");
     }
 }
+
+/*
+ * scheduler_kill: mark a live task as dead by numeric ID.
+ * The task remains in the list (shown as "off" in ps) until a
+ * future scheduler_init cleans everything up.
+ * Returns 0 on success, -1 if the ID is unknown or already dead.
+ */
+int scheduler_kill(int id) {
+    Task *t;
+
+    for (t = g_tasks; t; t = t->next) {
+        if (t->id == id) {
+            if (!t->alive)
+                return -1;   /* already dead */
+            t->alive = 0;
+            return 0;
+        }
+    }
+    return -1;   /* not found */
+}
