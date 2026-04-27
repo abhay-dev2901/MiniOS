@@ -1,5 +1,6 @@
 #include "vfs.h"
 
+#include "math.h"
 #include "memory.h"
 #include "string.h"
 
@@ -7,13 +8,14 @@
 
 enum {
     VFS_OK = 0,
-    VFS_ERR_NO_MEM = -1,
-    VFS_ERR_EXISTS = -2,
+    VFS_ERR_NO_MEM    = -1,
+    VFS_ERR_EXISTS    = -2,
     VFS_ERR_NOT_FOUND = -3,
-    VFS_ERR_NOT_DIR = -4,
-    VFS_ERR_NOT_FILE = -5,
-    VFS_ERR_BAD_PATH = -6,
-    VFS_ERR_IO = -7
+    VFS_ERR_NOT_DIR   = -4,
+    VFS_ERR_NOT_FILE  = -5,
+    VFS_ERR_BAD_PATH  = -6,
+    VFS_ERR_IO        = -7,
+    VFS_ERR_NOT_EMPTY = -8   /* directory is not empty */
 };
 
 typedef struct VfsNode VfsNode;
@@ -32,26 +34,19 @@ static VfsNode *g_root;
 
 const char *vfs_strerror(int err) {
     switch (err) {
-    case VFS_OK:
-        return "ok";
-    case VFS_ERR_NO_MEM:
-        return "out of memory";
-    case VFS_ERR_EXISTS:
-        return "already exists";
-    case VFS_ERR_NOT_FOUND:
-        return "not found";
-    case VFS_ERR_NOT_DIR:
-        return "not a directory";
-    case VFS_ERR_NOT_FILE:
-        return "not a file";
-    case VFS_ERR_BAD_PATH:
-        return "bad path";
-    case VFS_ERR_IO:
-        return "io error";
-    default:
-        return "unknown error";
+    case VFS_OK:            return "ok";
+    case VFS_ERR_NO_MEM:    return "out of memory";
+    case VFS_ERR_EXISTS:    return "already exists";
+    case VFS_ERR_NOT_FOUND: return "not found";
+    case VFS_ERR_NOT_DIR:   return "not a directory";
+    case VFS_ERR_NOT_FILE:  return "not a file";
+    case VFS_ERR_BAD_PATH:  return "bad path";
+    case VFS_ERR_IO:        return "io error";
+    case VFS_ERR_NOT_EMPTY: return "directory not empty";
+    default:                return "unknown error";
     }
 }
+
 
 static VfsNode *node_alloc(void) {
     return (VfsNode *)my_malloc(sizeof(VfsNode));
@@ -378,12 +373,13 @@ int vfs_write_file(const char *path, const void *data, size_t len, int append) {
         return VFS_ERR_IO;
 
     if (n->file_cap < newcap) {
-        size_t cap = n->file_cap ? n->file_cap : 256UL;
-        while (cap < newcap) {
-            if (cap > (1UL << 62))
-                return VFS_ERR_NO_MEM;
-            cap *= 2;
-        }
+        /*
+         * Grow to the next power of two >= newcap.
+         * my_next_pow2 replaces the manual doubling loop and also
+         * handles the edge case where newcap is already a power of two.
+         * Minimum capacity: 256 bytes.
+         */
+        size_t cap = my_max_sz(my_next_pow2(newcap), 256UL);
         newbuf = (char *)my_malloc(cap);
         if (!newbuf)
             return VFS_ERR_NO_MEM;
@@ -408,9 +404,8 @@ int vfs_read_file(const char *path, void *buf, size_t buf_size, size_t *out_len)
 
     if (!n)
         return VFS_ERR_NOT_FOUND;
-    copy = n->file_len;
-    if (copy > buf_size)
-        copy = buf_size;
+    /* Use my_min_sz so the copy length is always within bounds. */
+    copy = my_min_sz(n->file_len, buf_size);
     if (copy && n->file_data && buf)
         my_memcpy(buf, n->file_data, copy);
     if (out_len)
@@ -443,5 +438,151 @@ int vfs_list_dir(const char *path, void (*emit)(const char *name, int is_dir, vo
     lc.emit = emit;
     lc.ctx = ctx;
     list_emit(n, &lc);
+    return VFS_OK;
+}
+
+/* ---- Extended VFS operations ---- */
+
+/*
+ * vfs_stat: query metadata for any path.
+ * Fills *out_is_dir (1 = directory) and *out_size (byte length for files).
+ */
+int vfs_stat(const char *path, int *out_is_dir, size_t *out_size) {
+    VfsNode *n;
+
+    if (!g_root)
+        return VFS_ERR_NO_MEM;
+    n = lookup_any(path);
+    if (!n)
+        return VFS_ERR_NOT_FOUND;
+    if (out_is_dir)
+        *out_is_dir = n->is_dir ? 1 : 0;
+    if (out_size)
+        *out_size = n->is_dir ? 0 : n->file_len;
+    return VFS_OK;
+}
+
+/*
+ * vfs_remove: remove a file or an empty directory.
+ * Returns VFS_ERR_NOT_EMPTY if a non-empty directory is targeted.
+ */
+int vfs_remove(const char *path) {
+    VfsNode *parent;
+    char name[VFS_NAME_MAX];
+    VfsNode *n;
+    VfsNode **pp;
+    int st;
+
+    if (!g_root)
+        return VFS_ERR_NO_MEM;
+
+    /* Protect root */
+    if (path[0] == '/' && path[1] == 0)
+        return VFS_ERR_BAD_PATH;
+
+    st = split_parent_name(path, &parent, name);
+    if (st != VFS_OK)
+        return st;
+    if (name[0] == 0)
+        return VFS_ERR_BAD_PATH;
+
+    /* Walk parent's child list to find and unlink */
+    pp = &parent->first_child;
+    n  = NULL;
+    while (*pp) {
+        if (my_strcmp((*pp)->name, name) == 0) {
+            n = *pp;
+            break;
+        }
+        pp = &(*pp)->next_sibling;
+    }
+    if (!n)
+        return VFS_ERR_NOT_FOUND;
+
+    /* Refuse to remove a non-empty directory */
+    if (n->is_dir && n->first_child)
+        return VFS_ERR_NOT_EMPTY;
+
+    /* Unlink from sibling chain */
+    *pp = n->next_sibling;
+
+    /* Release file data if applicable */
+    if (!n->is_dir && n->file_data)
+        my_free(n->file_data);
+    my_free(n);
+    return VFS_OK;
+}
+
+/*
+ * vfs_rename: atomically move/rename a node within the VFS tree.
+ * The destination path must not already exist.
+ */
+int vfs_rename(const char *src, const char *dst) {
+    VfsNode *src_parent, *dst_parent;
+    char src_name[VFS_NAME_MAX], dst_name[VFS_NAME_MAX];
+    VfsNode *n;
+    VfsNode **pp;
+    int st;
+
+    if (!g_root)
+        return VFS_ERR_NO_MEM;
+
+    st = split_parent_name(src, &src_parent, src_name);
+    if (st != VFS_OK) return st;
+    st = split_parent_name(dst, &dst_parent, dst_name);
+    if (st != VFS_OK) return st;
+
+    if (src_name[0] == 0 || dst_name[0] == 0)
+        return VFS_ERR_BAD_PATH;
+
+    /* Locate source node */
+    pp = &src_parent->first_child;
+    n  = NULL;
+    while (*pp) {
+        if (my_strcmp((*pp)->name, src_name) == 0) {
+            n = *pp;
+            break;
+        }
+        pp = &(*pp)->next_sibling;
+    }
+    if (!n)
+        return VFS_ERR_NOT_FOUND;
+
+    /* Destination must be absent */
+    if (find_child(dst_parent, dst_name))
+        return VFS_ERR_EXISTS;
+
+    /* Unlink from source parent */
+    *pp = n->next_sibling;
+
+    /* Update name */
+    my_strncpy(n->name, dst_name, VFS_NAME_MAX - 1);
+    n->name[VFS_NAME_MAX - 1] = 0;
+
+    /* Attach to destination parent */
+    n->parent       = dst_parent;
+    n->next_sibling = dst_parent->first_child;
+    dst_parent->first_child = n;
+    return VFS_OK;
+}
+
+/*
+ * vfs_copy_file: duplicate a regular file to a new path.
+ * The destination file must not exist beforehand.
+ */
+int vfs_copy_file(const char *src, const char *dst) {
+    VfsNode *sn;
+    int st;
+
+    sn = lookup_file(src);
+    if (!sn)
+        return VFS_ERR_NOT_FOUND;
+
+    st = vfs_create_file(dst);
+    if (st != VFS_OK)
+        return st;
+
+    if (sn->file_len > 0)
+        return vfs_write_file(dst, sn->file_data, sn->file_len, 0);
     return VFS_OK;
 }
